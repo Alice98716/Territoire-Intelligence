@@ -1,68 +1,85 @@
 import os
-from dotenv import load_dotenv
+from geopy.distance import geodesic
 from langchain_community.vectorstores import FAISS 
-# Swapped to local Ollama modules
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.documents import Document
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 
-load_dotenv()
+def get_geo_data():
+    """Simulating a geospatial knowledge base with coordinates."""
+    return [
+        Document(
+            page_content="The Old Port of Montreal features historic buildings, a Ferris wheel, and extensive walking paths along the Saint Lawrence River.",
+            metadata={"name": "Old Port", "lat": 45.5048, "lon": -73.5492}
+        ),
+        Document(
+            page_content="Mount Royal Park is a vast green space offering panoramic city views, hiking trails, and the iconic Beaver Lake.",
+            metadata={"name": "Mount Royal", "lat": 45.5041, "lon": -73.5875}
+        ),
+        Document(
+            page_content="The Parliament Buildings in Quebec City feature stunning architecture, the Fontaine de Tourny, and rich political history.",
+            metadata={"name": "Parliament Buildings", "lat": 46.8083, "lon": -71.2141}
+        )
+    ]
 
 def main():
-    # --- STEP 1: LOAD ---
-    print("📂 Loading documents from ./data...")
-    if not os.path.exists("./data") or not os.listdir("./data"):
-        print("❌ Error: No .txt files found in the /data folder.")
-        return
-    
-    loader = DirectoryLoader("./data", glob="*.txt", loader_cls=TextLoader)
-    docs = loader.load()
-    print(f"✅ Loaded {len(docs)} documents.")
-
-    # --- STEP 2: CHUNK ---
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = splitter.split_documents(docs)
-    print(f"✂️ Split into {len(chunks)} chunks.")
-
-    # --- STEP 3: LOCAL EMBED ---
-    print("🧠 Generating local embeddings using Llama 3.2... (No cloud APIs!)")
-    # This instructs your computer to vectorize the text locally
+    print("🧠 Initializing local embeddings engine...")
     embeddings = OllamaEmbeddings(model="llama3.2:1b")
     
-    try:
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        print("✅ Local vector index created successfully!")
-    except Exception as e:
-        print(f"❌ EMBEDDING ERROR: {e}")
-        return
+    # 1. Create the vector store using our structured geo documents
+    raw_docs = get_geo_data()
+    vector_store = FAISS.from_documents(raw_docs, embeddings)
+    print("✅ Geospatial Vector store initialized successfully!")
 
-    # --- STEP 4: LOCAL LLM CHAIN ---
-    # Using your locally downloaded model
-    llm = ChatOllama(model="llama3.2:1b", temperature=0)
+    # 2. Simulate user location (e.g., Downtown Montreal)
+    user_location = (45.5017, -73.5673) 
+    max_distance_km = 5.0 # We only want places within 5km
+
+    # --- ADVANCED GEOSPATIAL FILTER ---
+    print(f"\n🌍 Filtering database assets within {max_distance_km}km of user location...")
     
+    # We pull ALL documents from FAISS to apply our geometric calculation
+    all_docs = vector_store.similarity_search("", k=100)
+    valid_geo_docs = []
+
+    for doc in all_docs:
+        doc_coords = (doc.metadata["lat"], doc.metadata["lon"])
+        # Calculate real-world distance on the Earth's curvature
+        distance = geodesic(user_location, doc_coords).kilometers
+        
+        if distance <= max_distance_km:
+            # Inject the calculated distance directly into the text context for the LLM!
+            doc.page_content += f" (Distance from user: {distance:.2f} km)"
+            valid_geo_docs.append(doc)
+
+    print(f"📌 Found {len(valid_geo_docs)} relevant geographic locations within your radius.")
+
+    # 3. Create a temporary vector store containing ONLY local assets
+    local_vector_store = FAISS.from_documents(valid_geo_docs, embeddings)
+
+    # 4. Initialize Local LLM Chain
+    llm = ChatOllama(model="llama3.2:1b", temperature=0)
     prompt = ChatPromptTemplate.from_template("""
-    Answer the question using ONLY the context below.
+    You are a geospatial analysis assistant. Answer the question using ONLY the geographically filtered context provided below.
+    
     Context: {context}
     Question: {input}
     """)
 
     chain = create_retrieval_chain(
-        vector_store.as_retriever(search_kwargs={"k": 2}), 
+        local_vector_store.as_retriever(search_kwargs={"k": 2}), 
         create_stuff_documents_chain(llm, prompt)
     )
 
-    # --- STEP 5: RUN ---
-    print("\n🚀 LOCAL RAG SYSTEM ONLINE (No limits!)")
+    print("\n🚀 GEOSPATIAL RAG READY")
     while True:
-        user_q = input("\nQuestion (or 'exit'): ")
+        user_q = input("\nWhat would you like to analyze? (or 'exit'): ")
         if user_q.lower() == 'exit': break
         
-        print("🔍 Searching local files and generating response...")
         result = chain.invoke({"input": user_q})
-        print(f"\nAI ANSWER: {result['answer']}")
+        print(f"\nAI ANALYSIS: {result['answer']}")
 
 if __name__ == "__main__":
     main()

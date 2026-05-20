@@ -18,3 +18,9 @@ chroma_db/
 # Operating System files (system junk files)
 .DS_Store
 Thumbs.db
+
+.venv/
+__pycache__/
+faiss_index/
+.env
+

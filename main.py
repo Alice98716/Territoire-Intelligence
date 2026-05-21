@@ -1,85 +1,186 @@
 import os
-from geopy.distance import geodesic
-from langchain_community.vectorstores import FAISS 
+import urllib.parse
+from pymongo import MongoClient
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.documents import Document
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_classic.chains.retrieval import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
-def get_geo_data():
-    """Simulating a geospatial knowledge base with coordinates."""
-    return [
-        Document(
-            page_content="The Old Port of Montreal features historic buildings, a Ferris wheel, and extensive walking paths along the Saint Lawrence River.",
-            metadata={"name": "Old Port", "lat": 45.5048, "lon": -73.5492}
-        ),
-        Document(
-            page_content="Mount Royal Park is a vast green space offering panoramic city views, hiking trails, and the iconic Beaver Lake.",
-            metadata={"name": "Mount Royal", "lat": 45.5041, "lon": -73.5875}
-        ),
-        Document(
-            page_content="The Parliament Buildings in Quebec City feature stunning architecture, the Fontaine de Tourny, and rich political history.",
-            metadata={"name": "Parliament Buildings", "lat": 46.8083, "lon": -71.2141}
-        )
-    ]
+load_dotenv()
 
-def main():
-    print("🧠 Initializing local embeddings engine...")
-    embeddings = OllamaEmbeddings(model="llama3.2:1b")
-    
-    # 1. Create the vector store using our structured geo documents
-    raw_docs = get_geo_data()
-    vector_store = FAISS.from_documents(raw_docs, embeddings)
-    print("✅ Geospatial Vector store initialized successfully!")
+def build_mongo_uri() -> str:
+    raw_uri = os.getenv("MONGO_URI", "")
+    if not raw_uri:
+        raise ValueError("MONGO_URI is not set in .env file.")
 
-    # 2. Simulate user location (e.g., Downtown Montreal)
-    user_location = (45.5017, -73.5673) 
-    max_distance_km = 5.0 # We only want places within 5km
+    prefix = "mongodb+srv://"
+    if not raw_uri.startswith(prefix):
+        return raw_uri  
 
-    # --- ADVANCED GEOSPATIAL FILTER ---
-    print(f"\n🌍 Filtering database assets within {max_distance_km}km of user location...")
-    
-    # We pull ALL documents from FAISS to apply our geometric calculation
-    all_docs = vector_store.similarity_search("", k=100)
-    valid_geo_docs = []
+    base = raw_uri[len(prefix):]
+    userinfo, host_and_options = base.split("@", 1)
+    username, password = userinfo.split(":", 1)
+    encoded_password = urllib.parse.quote_plus(password)
+    return f"{prefix}{username}:{encoded_password}@{host_and_options}"
 
-    for doc in all_docs:
-        doc_coords = (doc.metadata["lat"], doc.metadata["lon"])
-        # Calculate real-world distance on the Earth's curvature
-        distance = geodesic(user_location, doc_coords).kilometers
-        
-        if distance <= max_distance_km:
-            # Inject the calculated distance directly into the text context for the LLM!
-            doc.page_content += f" (Distance from user: {distance:.2f} km)"
-            valid_geo_docs.append(doc)
 
-    print(f"📌 Found {len(valid_geo_docs)} relevant geographic locations within your radius.")
+def retrieve_territorial_context(
+    user_lon: float, user_lat: float, radius_meters: int
+) -> list[Document]:
+    #Query MongoDB and return docs for RAG context 
+    client = MongoClient(build_mongo_uri())
+    db = client.overture_maps
+    rag_documents: list[Document] = []
 
-    # 3. Create a temporary vector store containing ONLY local assets
-    local_vector_store = FAISS.from_documents(valid_geo_docs, embeddings)
+    #Module 1: Local vacant
+    print(f"Searching vacant locals near ({user_lon}, {user_lat}) within {radius_meters}m...")
+    try:
+        locaux_query = {
+            "geometry": {
+                "$near": {
+                    "$geometry": {"type": "Point", "coordinates": [user_lon, user_lat]},
+                    "$maxDistance": radius_meters,
+                }
+            }
+        }
+        found_items = list(db.locaux_vacants.find(locaux_query).limit(10))
+        print(f"  → {len(found_items)} vacant local(s) found.")
+        for local in found_items:
+            text = (
+                f"[IMMOBILIER VACANT - {local.get('type_local')}] "
+                f"Located at {local.get('adresse')}. "
+                f"This property is in a sector with {local.get('notes', 'no additional details')}. "
+                f"Market price: {local.get('prix')}."
+            )
+            rag_documents.append(Document(page_content=text, metadata={"type": "local"}))
+    except Exception as e:
+        print(f"Erreur locaux (check 2dsphere index): {e}")
 
-    # 4. Initialize Local LLM Chain
+    #Module 2: Demographie des villes
+    try:
+        # Instead of: db.cities.find_one({"name": "Saint-Hyacinthe"}), plus general
+        city_data = db.cities.find_one({
+            "geometry": {
+                "$geoIntersects": {
+                    "$geometry": {
+                        "type": "Point",
+                        "coordinates": [user_lon, user_lat]
+                    }
+                }
+            }
+        })
+        if city_data:
+            text = (
+                f"[VILLE: {city_data.get('name', 'N/A')}] "
+                f"Population 2021: {city_data.get('Population_2021', 'N/A')}"
+            )
+            rag_documents.append(Document(page_content=text, metadata={"type": "city"}))
+            print(f"City data loaded.")
+        else:
+            print("No city data found.")
+    except Exception as e:
+        print(f"Erreur villes: {e}")
+
+    #Module 3: NAICS
+    try:
+        sectors = list(db.naics.find({}).limit(10))
+        for sector in sectors:
+            label = sector.get("label", "Unknown sector")
+            rag_documents.append(
+                Document(page_content=f"[NAICS] {label}", metadata={"type": "naics"})
+            )
+        print(f"{len(sectors)} NAICS sector(s) loaded.")
+    except Exception as e:
+        print(f"Erreur NAICS: {e}")
+
+    return rag_documents
+
+
+def build_chain(docs: list[Document]):
+    """Build the FAISS vector store and RAG chain from documents."""
+    print("\nBuilding embeddings and vector store")
+    embeddings = OllamaEmbeddings(model="llama3.2:1b") #PEUT SWITCHER A MEILLEUR MODELE PRETENTRAINE
+    vector_store = FAISS.from_documents(docs, embeddings)
+
     llm = ChatOllama(model="llama3.2:1b", temperature=0)
-    prompt = ChatPromptTemplate.from_template("""
-    You are a geospatial analysis assistant. Answer the question using ONLY the geographically filtered context provided below.
-    
-    Context: {context}
-    Question: {input}
-    """)
+
+    #WORK ON PROMPT FOR BETTER RESULTS
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """You are a precise territorial analysis assistant for Quebec municipalities.
+
+Rules:
+- Answer ONLY using the provided context. Never invent data.
+- If the answer is not in the context, respond exactly: "Information non disponible dans le contexte."
+- Always respond in the same language as the user's question (French or English).
+- Be concise and structured. Use bullet points for lists of items.
+- When mentioning properties or businesses, include all available details (address, type, price).
+- Do not speculate or add general knowledge beyond what is in the context.
+
+Context:
+{context}""",
+        ),
+        ("human", "{input}"),
+    ])
+
+    combine_docs_chain = create_stuff_documents_chain(llm, prompt)
 
     chain = create_retrieval_chain(
-        local_vector_store.as_retriever(search_kwargs={"k": 2}), 
-        create_stuff_documents_chain(llm, prompt)
+        retriever=vector_store.as_retriever(
+            search_kwargs={
+                "k": 6,
+                "filter": {"type": {"$in": ["local", "city", "naics"]}} #Diverse doc retrieval (see if best)
+            }
+        ),
+        combine_docs_chain=combine_docs_chain,
+    )
+    return chain
+
+
+def main():
+    #to load context
+    docs = retrieve_territorial_context(
+        user_lon=-72.9427, user_lat=45.6255, radius_meters=15000 #hard coded for testing but this would be user input 
     )
 
-    print("\n🚀 GEOSPATIAL RAG READY")
+    if not docs:
+        print("\n Aucun document trouvé dans MongoDB. Vérifiez votre connexion et vos données.")
+        return
+
+    print(f"\n {len(docs)} document(s) chargés.")
+
+    #for testing phase printing the context 
+    print("\n CONTEXTE ENVOYÉ AU MODÈLE ")
+    for i, doc in enumerate(docs, 1):
+        print(f"[{i}] ({doc.metadata.get('type')}) {doc.page_content}")
+    print("---------------------------------\n")
+
+
+    chain = build_chain(docs)
+
+    #Question loop 
+    print("Prêt. Posez vos questions (tapez 'exit' pour quitter).\n")
     while True:
-        user_q = input("\nWhat would you like to analyze? (or 'exit'): ")
-        if user_q.lower() == 'exit': break
-        
-        result = chain.invoke({"input": user_q})
-        print(f"\nAI ANALYSIS: {result['answer']}")
+        user_q = input("Question : ").strip()
+        if not user_q:
+            continue
+        if user_q.lower() in ("exit", "quit", "q"):
+            print("Au revoir!")
+            break
+
+        try:
+            result = chain.invoke({"input": user_q})
+            answer = result.get("answer", "").strip()
+            if not answer:
+                answer = "Information non disponible dans le contexte."
+            print(f"\nRÉPONSE :\n{answer}\n")
+        except Exception as e:
+            print(f"\nErreur lors de l'inférence : {e}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -12,14 +12,13 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 load_dotenv()
 
 def build_mongo_uri() -> str:
-    """Safely encode the MongoDB URI from the .env file."""
     raw_uri = os.getenv("MONGO_URI", "")
     if not raw_uri:
-        raise ValueError("MONGO_URI is not set in your .env file.")
+        raise ValueError("MONGO_URI is not set in .env file.")
 
     prefix = "mongodb+srv://"
     if not raw_uri.startswith(prefix):
-        return raw_uri  # Already a plain URI 
+        return raw_uri  
 
     base = raw_uri[len(prefix):]
     userinfo, host_and_options = base.split("@", 1)
@@ -31,12 +30,12 @@ def build_mongo_uri() -> str:
 def retrieve_territorial_context(
     user_lon: float, user_lat: float, radius_meters: int
 ) -> list[Document]:
-    """Query MongoDB and return LangChain Documents for RAG context."""
+    #Query MongoDB and return docs for RAG context 
     client = MongoClient(build_mongo_uri())
     db = client.overture_maps
     rag_documents: list[Document] = []
 
-    # --- Vacant locals (geospatial) ---
+    #Module 1: Local vacant
     print(f"Searching vacant locals near ({user_lon}, {user_lat}) within {radius_meters}m...")
     try:
         locaux_query = {
@@ -50,7 +49,6 @@ def retrieve_territorial_context(
         found_items = list(db.locaux_vacants.find(locaux_query).limit(10))
         print(f"  → {len(found_items)} vacant local(s) found.")
         for local in found_items:
-            # In retrieve_territorial_context, create richer descriptions:
             text = (
                 f"[IMMOBILIER VACANT - {local.get('type_local')}] "
                 f"Located at {local.get('adresse')}. "
@@ -59,13 +57,11 @@ def retrieve_territorial_context(
             )
             rag_documents.append(Document(page_content=text, metadata={"type": "local"}))
     except Exception as e:
-        print(f"  ✗ Erreur locaux (check 2dsphere index): {e}")
+        print(f"Erreur locaux (check 2dsphere index): {e}")
 
-    # --- City demographics ---
-    print("Searching city data...")
+    #Module 2: Demographie des villes
     try:
-        # Instead of: db.cities.find_one({"name": "Saint-Hyacinthe"})
-        # Use this to find the city enclosing your point:
+        # Instead of: db.cities.find_one({"name": "Saint-Hyacinthe"}), plus general
         city_data = db.cities.find_one({
             "geometry": {
                 "$geoIntersects": {
@@ -82,14 +78,13 @@ def retrieve_territorial_context(
                 f"Population 2021: {city_data.get('Population_2021', 'N/A')}"
             )
             rag_documents.append(Document(page_content=text, metadata={"type": "city"}))
-            print(f"  → City data loaded.")
+            print(f"City data loaded.")
         else:
-            print("  → No city data found.")
+            print("No city data found.")
     except Exception as e:
-        print(f"  ✗ Erreur villes: {e}")
+        print(f"Erreur villes: {e}")
 
-    # --- NAICS sectors ---
-    print("Searching NAICS sectors...")
+    #Module 3: NAICS
     try:
         sectors = list(db.naics.find({}).limit(10))
         for sector in sectors:
@@ -97,23 +92,22 @@ def retrieve_territorial_context(
             rag_documents.append(
                 Document(page_content=f"[NAICS] {label}", metadata={"type": "naics"})
             )
-        print(f"  → {len(sectors)} NAICS sector(s) loaded.")
+        print(f"{len(sectors)} NAICS sector(s) loaded.")
     except Exception as e:
-        print(f"  ✗ Erreur NAICS: {e}")
+        print(f"Erreur NAICS: {e}")
 
     return rag_documents
 
 
 def build_chain(docs: list[Document]):
     """Build the FAISS vector store and RAG chain from documents."""
-    print("\nBuilding embeddings and vector store...")
-    embeddings = OllamaEmbeddings(model="llama3.2:1b")
+    print("\nBuilding embeddings and vector store")
+    embeddings = OllamaEmbeddings(model="llama3.2:1b") #PEUT SWITCHER A MEILLEUR MODELE PRETENTRAINE
     vector_store = FAISS.from_documents(docs, embeddings)
 
     llm = ChatOllama(model="llama3.2:1b", temperature=0)
 
-
-    # Strong system prompt to prevent hallucination and enforce structure
+    #WORK ON PROMPT FOR BETTER RESULTS
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -135,13 +129,11 @@ Context:
 
     combine_docs_chain = create_stuff_documents_chain(llm, prompt)
 
-    # Retrieve top-5 most relevant documents for each query
-    # Modify your retriever in build_chain() to ensure diversity:
     chain = create_retrieval_chain(
         retriever=vector_store.as_retriever(
             search_kwargs={
                 "k": 6,
-                "filter": {"type": {"$in": ["local", "city", "naics"]}} # Ensure balance
+                "filter": {"type": {"$in": ["local", "city", "naics"]}} #Diverse doc retrieval (see if best)
             }
         ),
         combine_docs_chain=combine_docs_chain,
@@ -150,9 +142,9 @@ Context:
 
 
 def main():
-    # --- Load context from MongoDB ---
+    #to load context
     docs = retrieve_territorial_context(
-        user_lon=-72.9427, user_lat=45.6255, radius_meters=15000
+        user_lon=-72.9427, user_lat=45.6255, radius_meters=15000 #hard coded for testing but this would be user input 
     )
 
     if not docs:
@@ -161,16 +153,16 @@ def main():
 
     print(f"\n {len(docs)} document(s) chargés.")
 
-    # --- Debug: show what the AI will see ---
-    print("\n--- CONTEXTE ENVOYÉ AU MODÈLE ---")
+    #for testing phase printing the context 
+    print("\n CONTEXTE ENVOYÉ AU MODÈLE ")
     for i, doc in enumerate(docs, 1):
         print(f"[{i}] ({doc.metadata.get('type')}) {doc.page_content}")
     print("---------------------------------\n")
 
-    # --- Build the RAG chain ---
+
     chain = build_chain(docs)
 
-    # --- Interactive Q&A loop ---
+    #Question loop 
     print("Prêt. Posez vos questions (tapez 'exit' pour quitter).\n")
     while True:
         user_q = input("Question : ").strip()
@@ -187,7 +179,7 @@ def main():
                 answer = "Information non disponible dans le contexte."
             print(f"\nRÉPONSE :\n{answer}\n")
         except Exception as e:
-            print(f"\n✗ Erreur lors de l'inférence : {e}\n")
+            print(f"\nErreur lors de l'inférence : {e}\n")
 
 
 if __name__ == "__main__":

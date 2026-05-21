@@ -1,5 +1,6 @@
 import os
 import urllib.parse
+import argparse
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
@@ -11,27 +12,18 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 
 load_dotenv()
 
-def build_mongo_uri() -> str:
-    raw_uri = os.getenv("MONGO_URI", "")
-    if not raw_uri:
+def get_mongo_client() -> MongoClient:
+    uri = os.getenv("MONGO_URI", "")
+    if not uri:
         raise ValueError("MONGO_URI is not set in .env file.")
-
-    prefix = "mongodb+srv://"
-    if not raw_uri.startswith(prefix):
-        return raw_uri  
-
-    base = raw_uri[len(prefix):]
-    userinfo, host_and_options = base.split("@", 1)
-    username, password = userinfo.split(":", 1)
-    encoded_password = urllib.parse.quote_plus(password)
-    return f"{prefix}{username}:{encoded_password}@{host_and_options}"
+    return MongoClient(uri, serverSelectionTimeoutMS=5000)
 
 
 def retrieve_territorial_context(
     user_lon: float, user_lat: float, radius_meters: int
 ) -> list[Document]:
     #Query MongoDB and return docs for RAG context 
-    client = MongoClient(build_mongo_uri())
+    client = get_mongo_client()
     db = client.overture_maps
     rag_documents: list[Document] = []
 
@@ -47,7 +39,7 @@ def retrieve_territorial_context(
             }
         }
         found_items = list(db.locaux_vacants.find(locaux_query).limit(10))
-        print(f"  → {len(found_items)} vacant local(s) found.")
+        print(f" {len(found_items)} vacant local(s) found.")
         for local in found_items:
             text = (
                 f"[IMMOBILIER VACANT - {local.get('type_local')}] "
@@ -102,7 +94,7 @@ def retrieve_territorial_context(
 def build_chain(docs: list[Document]):
     """Build the FAISS vector store and RAG chain from documents."""
     print("\nBuilding embeddings and vector store")
-    embeddings = OllamaEmbeddings(model="llama3.2:1b") #PEUT SWITCHER A MEILLEUR MODELE PRETENTRAINE
+    embeddings = OllamaEmbeddings(model="nomic-embed-text") #swtiched to specialized embedding model 
     vector_store = FAISS.from_documents(docs, embeddings)
 
     llm = ChatOllama(model="llama3.2:1b", temperature=0)
@@ -132,8 +124,7 @@ Context:
     chain = create_retrieval_chain(
         retriever=vector_store.as_retriever(
             search_kwargs={
-                "k": 6,
-                "filter": {"type": {"$in": ["local", "city", "naics"]}} #Diverse doc retrieval (see if best)
+                "k": 6
             }
         ),
         combine_docs_chain=combine_docs_chain,
@@ -142,27 +133,29 @@ Context:
 
 
 def main():
-    #to load context
+    parser = argparse.ArgumentParser(description="Territoire Intelligence RAG Baseline")
+    parser.add_argument("--lon", type=float, default=-72.9427, help="User Longitude") #hard coded but should be user's input 
+    parser.add_argument("--lat", type=float, default=45.6255, help="User Latitude")
+    parser.add_argument("--radius", type=int, default=15000, help="Search radius in meters")
+    args = parser.parse_args()
+
     docs = retrieve_territorial_context(
-        user_lon=-72.9427, user_lat=45.6255, radius_meters=15000 #hard coded for testing but this would be user input 
+        user_lon=args.lon, user_lat=args.lat, radius_meters=args.radius
     )
 
     if not docs:
-        print("\n Aucun document trouvé dans MongoDB. Vérifiez votre connexion et vos données.")
+        print("\nAucun document trouvé dans MongoDB. Vérifiez votre connexion et vos données.")
         return
 
-    print(f"\n {len(docs)} document(s) chargés.")
+    print(f"\n{len(docs)} document(s) chargés.")
 
-    #for testing phase printing the context 
-    print("\n CONTEXTE ENVOYÉ AU MODÈLE ")
+    print("\nCONTEXTE ENVOYÉ AU MODÈLE")
     for i, doc in enumerate(docs, 1):
         print(f"[{i}] ({doc.metadata.get('type')}) {doc.page_content}")
     print("---------------------------------\n")
 
-
     chain = build_chain(docs)
 
-    #Question loop 
     print("Prêt. Posez vos questions (tapez 'exit' pour quitter).\n")
     while True:
         user_q = input("Question : ").strip()

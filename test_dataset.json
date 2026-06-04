@@ -1,0 +1,182 @@
+[
+  {
+    "id": "Q1",
+    "category": "RETRIEVAL GÉOSPATIAL",
+    "question": "Quels sont les locaux vacants disponibles à moins de 5 km de ma position ?",
+    "expected_path": "spatial",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Retrieval Accuracy"
+  },
+  {
+    "id": "Q2",
+    "category": "RETRIEVAL GÉOSPATIAL",
+    "question": "Is there a vacant property located exactly at 450 rue Girouard, Saint-Hyacinthe ?",
+    "expected_path": "price_inquiry",
+    "expected_top_n": 1,
+    "expected_type_filter": [],
+    "metric": "Extraction Precision"
+  },
+  {
+    "id": "Q3",
+    "category": "RETRIEVAL GÉOSPATIAL",
+    "question": "Quelle est la population de la ville dans laquelle je me trouve actuellement ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Spatial Intersection"
+  },
+  {
+    "id": "Q13",
+    "category": "RETRIEVAL GÉOSPATIAL",
+    "question": "Quels locaux sont devenus vacants dans les 30 derniers jours dans ce secteur ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Temporal Filtering + Faithfulness"
+  },
+  {
+    "id": "Q4",
+    "category": "ANTI-HALLUCINATION & ROBUSTESSE",
+    "question": "Quelle est la population de Paris ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Anti-Hallucination"
+  },
+  {
+    "id": "Q5",
+    "category": "ANTI-HALLUCINATION & ROBUSTESSE",
+    "question": "Donne-moi le prix du local au 9999 Rue Imaginaire.",
+    "expected_path": "price_inquiry",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Faithfulness"
+  },
+  {
+    "id": "Q6",
+    "category": "ANTI-HALLUCINATION & ROBUSTESSE",
+    "question": "What is the capital of Canada?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Context Adhesion"
+  },
+  {
+    "id": "Q14",
+    "category": "ANTI-HALLUCINATION & ROBUSTESSE",
+    "question": "OK alors quelle est la ville québécoise qui ressemble le plus à Paris en termes de taille de population ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Conversational Consistency"
+  },
+  {
+    "id": "Q7",
+    "category": "SYNTHÈSE & RAISONNEMENT MULTI-SOURCES",
+    "question": "Fais-moi un résumé du secteur : quelle est la population locale et quels locaux commerciaux y sont vides ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": ["commercial"],
+    "metric": "Synthesis Ability"
+  },
+  {
+    "id": "Q8",
+    "category": "SYNTHÈSE & RAISONNEMENT MULTI-SOURCES",
+    "question": "Y a-t-il un local vacant qui convient à une entreprise du secteur de la restauration (NAICS 7225) ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Semantic Mapping"
+  },
+  {
+    "id": "Q15",
+    "category": "SYNTHÈSE & RAISONNEMENT MULTI-SOURCES",
+    "question": "Quels sont les commerces de restauration dans un rayon de 500 m du local au 1000 rue des Cascades ?",
+    "expected_path": "spatial",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Categorical Retrieval + Spatial Intersection"
+  },
+  {
+    "id": "Q16",
+    "category": "SYNTHÈSE & RAISONNEMENT MULTI-SOURCES",
+    "question": "Quel est le taux de restaurants sur cette artère commerciale ? Y a-t-il un secteur d'activité sur-représenté ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Aggregation + Semantic Mapping"
+  },
+  {
+    "id": "Q17",
+    "category": "SYNTHÈSE & RAISONNEMENT MULTI-SOURCES",
+    "question": "Combien y a-t-il de locaux vacants en tout sur l'artère principale de Saint-Constant ? Quel est le taux de vacance approximatif ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Aggregation Accuracy"
+  },
+  {
+    "id": "Q10",
+    "category": "GESTION DE L'INCERTITUDE & REQUÊTES COMPLEXES",
+    "question": "Donne-moi les détails du local le moins cher.",
+    "expected_path": "price_inquiry",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Completeness"
+  },
+  {
+    "id": "Q18",
+    "category": "GESTION DE L'INCERTITUDE & REQUÊTES COMPLEXES",
+    "question": "Je cherche un local de moins de 2 000 $/mois, d'au moins 80 m², dans un secteur avec un revenu médian supérieur à 60 000 $. Qu'est-ce qui est disponible ?",
+    "expected_path": "price_inquiry",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Multi-Criteria Retrieval + Completeness"
+  },
+  {
+    "id": "Q19",
+    "category": "GESTION DE L'INCERTITUDE & REQUÊTES COMPLEXES",
+    "question": "Je veux ouvrir une boutique tendance dans un quartier branché de Montréal, c'est quoi le meilleur endroit ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": ["commercial"],
+    "metric": "Intent Disambiguation + Hypothesis Transparency"
+  },
+  {
+    "id": "Q20",
+    "category": "GESTION DE L'INCERTITUDE & REQUÊTES COMPLEXES",
+    "question": "Est-ce que je peux ouvrir un bar dans le local au 2300 rue Girouard ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Faithfulness + Context Adhesion"
+  },
+  {
+    "id": "Q9",
+    "category": "FORMAT, LANGUE & UX",
+    "question": "List all vacant properties found near me.",
+    "expected_path": "filter",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Layout Adherence"
+  },
+  {
+    "id": "Q11",
+    "category": "FORMAT, LANGUE & UX",
+    "question": "What are the vacancy notes for the property on 450 rue Girouard ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Language Matching"
+  },
+  {
+    "id": "Q12",
+    "category": "FORMAT, LANGUE & UX",
+    "question": "Est-ce qu'il y a des informations disponibles concernant la démographie ici ?",
+    "expected_path": "qualitative",
+    "expected_top_n": 5,
+    "expected_type_filter": [],
+    "metric": "Language Matching"
+  }
+]

@@ -31,8 +31,8 @@ def get_location_from_id(da_id):
     
     if not result.empty:
 
-        # 'CSDNAME_SDRNOM' is the City/Municipality name
-        # 'PRNAME_PRNOM' is the Province name
+        #'CSDNAME_SDRNOM' = municipality name 
+        #'PRNAME_PRNOM' = province
         city = result.iloc[0]['CSDNAME_SDRNOM']
         province = result.iloc[0]['PRNAME_PRNOM']
         
@@ -56,4 +56,4 @@ def get_ids_from_city(city_name):
 
 ids_in_montreal = get_ids_from_city("Montréal")
 print(f"Found {len(ids_in_montreal)} Dissemination Areas in Montréal.")
-print(ids_in_montreal[:10])  #10 premiers
+print(ids_in_montreal[:10])  

@@ -36,7 +36,7 @@ CONFIG = {
     "LOCAUX_LIMIT":     100,      
     "NAICS_LIMIT":      50,
     "EMBED_MODEL":      "nomic-embed-text",
-    "LLM_MODEL":        "llama3.2:3b",
+    "LLM_MODEL":        "llama3.2:1b",
     "LLM_TEMPERATURE":  0,
     "NOTES_MIN_LENGTH": 50,
     "CHUNK_SIZE":       400,
@@ -371,8 +371,27 @@ def classify_question(question: str) -> str:
 
 
 def _parse_top_n(question: str, default: int | None = None) -> int:
-
     default = default or CONFIG["DEFAULT_TOP_N"]
+    q = question.lower()
+
+    #Map text numbers to digits before processing regex
+    text_to_num = {
+        "un": "1", "one": "1",
+        "deux": "2", "two": "2",
+        "trois": "3", "three": "3",
+        "quatre": "4", "four": "4",
+        "cinq": "5", "five": "5",
+        "six": "6", "six": "6",
+        "sept": "7", "seven": "7",
+        "huit": "8", "eight": "8",
+        "neuf": "9", "nine": "9",
+        "dix": "10", "ten": "10"
+    }
+    
+    for word, num in text_to_num.items():
+        #Match word boundaries to prevent replacing partial words
+        q = re.sub(r'\b' + word + r'\b', num, q)
+
     patterns = [
         r"\btop\s+(\d+)\b", r"\bles\s+(\d+)\s+plus\s+proch", r"\bles\s+(\d+)\s+premiers?\b",
         r"\b(\d+)\s+plus\s+proch", r"\bgive\s+me\s+(\d+)\b", r"\bshow\s+(?:me\s+)?(\d+)\b",
@@ -380,7 +399,7 @@ def _parse_top_n(question: str, default: int | None = None) -> int:
         r"\b(\d+)\s+locaux\b", r"\bles\s+(\d+)\b",
     ]
     for p in patterns:
-        m = re.search(p, question.lower())
+        m = re.search(p, q)
         if m:
             return max(1, min(int(m.group(1)), 50))
     return default
@@ -482,15 +501,31 @@ def answer_filter(question: str, local_index: list[dict]) -> str:
         lines.append("")
     return "\n".join(lines)
 
-
 def _parse_price(prix_str: str) -> float:
-
+    if prix_str is None or str(prix_str).strip() in _EMPTY:
+        return float("inf")
+        
+    p = str(prix_str).strip()
+    
+    #case 1: thousand seperators
+    if re.search(r',\d{3}(?:\D|$)', p) and "." not in p:
+        p = p.replace(",", "")
+    else:
+        #otherwise treat as european separator
+        p = p.replace(",", ".")
+        
     try:
-        digits = re.sub(r"[^\d.]", "", str(prix_str).replace(",", "."))
+        #keep decimal point and number
+        digits = re.sub(r"[^\d.]", "", p)
+        
+        if digits.count(".") > 1:
+            parts = digits.split(".")
+            digits = parts[0] + "." + "".join(parts[1:])
+            
         return float(digits) if digits else float("inf")
     except (ValueError, TypeError):
         return float("inf")
-
+    
 def answer_price_inquiry(question: str, local_index: list[dict]) -> str:
     q_lower = question.lower()
     addresses = sorted([e.get("Adresse", "") for e in local_index if e.get("Adresse")], key=len, reverse=True)

@@ -11,15 +11,6 @@ DetectorFactory.seed = 0
 
 load_dotenv()
 
-# Create a file named debug_env.py and run: uv run python debug_env.py
-import os
-from dotenv import find_dotenv, load_dotenv
-
-found = find_dotenv()
-print(f"Loading .env file at: {found}")
-load_dotenv(found)
-print(f"Key found: {'YES' if os.getenv('ANTHROPIC_API_KEY') else 'NO'}")
-
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not API_KEY:
     print("critical error: ANTHROPIC_API_KEY is missing.")

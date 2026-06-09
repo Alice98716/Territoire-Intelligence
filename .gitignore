@@ -23,4 +23,11 @@ Thumbs.db
 __pycache__/
 faiss_index/
 .env
-
+# Ignore large geospatial and data files
+2021_92-151_X/
+lad_000a21a_f/
+*.csv
+*.shp
+lad_000a21a_f/lad_000a21a_f.shp
+2021_92-151_X/2021_92-151_X.csv
+lad_000a21a_f.zip

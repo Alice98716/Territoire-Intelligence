@@ -17,18 +17,49 @@ EMBED_MODEL = "nomic-embed-text"
 DEFAULT_RADIUS_METERS = 5000
 NOMINATIM_USER_AGENT = "quebec_territorial_intelligence_rag"
 DB_NAME = "overture_maps"  
+NAICS_COLLECTION_NAME = "naics" # <-- Ensure this matches your DB collection name
 
 class QueryExtractor:
     """
     Handles query understanding by combining low-latency Regular Expressions 
     with a local LLM fallback for conversational or complex user queries.
+    Now includes a semantic lookup index for NAICS codes.
     """
-    def __init__(self, model_name: str, db: pymongo.database.Database):
+    def __init__(self, model_name: str, db: pymongo.database.Database, embeddings):
         self.llm = ChatOllama(model=model_name, format="json", temperature=0)
         self.db = db  
+        self.embeddings = embeddings
+        
+        # Initialize NAICS semantic lookup in memory
+        self.naics_retriever = self._init_naics_index()
+        
         self.distance_pattern = r'(\d+(?:\.\d+)?)\s*(m|km|mi|meters?|kilometers?|miles?|mètres?|kilomètres?)\b'
-        self.location_pattern = r'(?:near|close to|around|près de|à côté de|of|du|de la|des|de)\s+(?:the|le|la|l\')?\s*([^,.\n?]+)'
+        self.location_pattern = r'(?:near|close to|around|près de|à côté de|autour de|within\s+(?:\d+(?:\.\d+)?\s*[a-zA-Z]+)?\s+of)\s+(?:the|le|la|l\')?\s*([^,.\n?]+)'
         self.naics_pattern = r'\bnaics\s*[:#-]?\s*(\d{2,6})\b'
+
+    def _init_naics_index(self):
+        print("[System] Initializing NAICS semantic lookup index...")
+        cursor = self.db[NAICS_COLLECTION_NAME].find({}) 
+        docs = []
+        for doc in cursor:
+            naics_code = doc.get("naics")
+            label = doc.get("label", "")
+            
+            subsectors = doc.get("subsectors", [])
+            subsector_text = " ".join([str(s) for s in subsectors]) if isinstance(subsectors, list) else str(subsectors)
+            
+            search_content = f"{label}. {subsector_text}"
+            
+            if naics_code and label:
+                docs.append(Document(page_content=search_content, metadata={"naics": naics_code}))
+        
+        if docs:
+            vectorstore = FAISS.from_documents(docs, self.embeddings)
+            print(f"[System] NAICS index built successfully with {len(docs)} categories.")
+            return vectorstore.as_retriever(search_kwargs={"k": 1})
+        
+        print("[System Warning] NAICS index is empty. Check collection name and data.")
+        return None
 
     def _convert_to_meters(self, value: float, unit: str) -> float:
         unit = unit.lower()
@@ -72,7 +103,7 @@ class QueryExtractor:
         elif any(word in query_clean for word in business_keywords):
             intent = "quebec_businesses"
             
-        #if explicit radius is mentionned short circuit Regex 
+        # if explicit radius is mentionned short circuit Regex 
         if dist_match and loc_match and intent != "both":
             raw_val = float(dist_match.group(1))
             unit_str = dist_match.group(2)
@@ -83,11 +114,15 @@ class QueryExtractor:
             
             print(f"[Query Understanding] Fast-path Regex activated. Location: '{extracted_loc}' | Radius: {dist_meters}m")
             
-            #extract NAICS when using fast path REGEX
+            # extract NAICS when using fast path REGEX
             naics_match = re.search(self.naics_pattern, query_clean)
             extracted_naics = naics_match.group(1) if naics_match else None
 
-            #enforce pre-determined radius 
+            if intent == "quebec_businesses" and not extracted_naics:
+                print("[Query Understanding] Missing explicit NAICS number. Routing to LLM for semantic translation...")
+                return self._fallback_llm_fields(query, extracted_loc, dist_meters, intent)
+
+            # enforce pre-determined radius 
             if intent == "demographics":
                 return self._fallback_llm_fields(query, extracted_loc, dist_meters, intent)
                 
@@ -116,7 +151,7 @@ class QueryExtractor:
         "- 'distance_meters': integer representing distance in meters. Return null if no explicit distance is mentioned.\n"
         "- 'collection_intent': string ('demographics', 'locaux_vacants', 'quebec_businesses', or 'both').\n"
         "- 'required_fields': an array of strings (max 6). Match keys exactly from the available columns list.\n"
-        "- 'naics_code': string. Extract the exact NAICS code if provided. If no code is provided, but the user asks for a specific business type (e.g., 'restaurants', 'gyms'), logically deduce the most accurate 2 to 4-digit NAICS code. Return null if not applicable."
+        "- 'business_category': string. Extract the type of business, service, or industry requested (e.g., 'Soins de santé et assistance sociale', 'restaurants', 'gyms'). Return null if not applicable."
         )
         
         chain = prompt | self.llm
@@ -128,7 +163,19 @@ class QueryExtractor:
             cleaned_json_string = re.sub(r'```json\s*|```', '', response.content).strip()
             parsed_json = json.loads(cleaned_json_string)
             
-            #go through REGEX
+            # Semantic Lookup for NAICS
+            extracted_category = parsed_json.get("business_category")
+            parsed_json["naics_code"] = None 
+            
+            if extracted_category and self.naics_retriever:
+                naics_docs = self.naics_retriever.invoke(extracted_category)
+                if naics_docs:
+                    matched_code = naics_docs[0].metadata["naics"]
+                    matched_label = naics_docs[0].page_content.split('.')[0]
+                    parsed_json["naics_code"] = matched_code
+                    print(f"[Query Understanding] Grounded intent '{extracted_category}' to NAICS {matched_code} ({matched_label})")
+
+            # Route through REGEX overrides
             if pre_loc:
                 parsed_json["location"] = pre_loc
             if pre_dist:
@@ -137,9 +184,10 @@ class QueryExtractor:
                 parsed_json["collection_intent"] = intent
                 
             return parsed_json
+            
         except Exception as e:
             print(f"[Query Understanding Error] Failed to parse LLM structured output: {e}")
-            return {"location": pre_loc, "distance_meters": pre_dist, "collection_intent": intent, "required_fields": []}
+            return {"location": pre_loc, "distance_meters": pre_dist, "collection_intent": intent, "required_fields": [], "naics_code": None}
 
 
 class SpatialHybridRAG:
@@ -148,16 +196,36 @@ class SpatialHybridRAG:
         self.db = self.client[db_name]
         
         self.geolocator = Nominatim(user_agent=NOMINATIM_USER_AGENT)
-        self.extractor = QueryExtractor(LLM_MODEL, self.db) 
         self.embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+        
+        # IMPORTANT: Pass embeddings to the extractor so it can build the NAICS index
+        self.extractor = QueryExtractor(LLM_MODEL, self.db, self.embeddings) 
 
     def geocode_landmark(self, landmark_name: str) -> tuple:
         try:
-            search_context = f"{landmark_name}, Quebec, Canada"
+            # 1. Clean conversational suffixes that break Nominatim
+            clean_name = landmark_name.lower()
+            suffixes_to_remove = [
+                "city center", "city centre", "center", "centre", 
+                "downtown", "centre-ville", "centre ville"
+            ]
+            for suffix in suffixes_to_remove:
+                # Remove suffix if it appears at the end of the location string
+                clean_name = re.sub(rf'\b{suffix}\b\s*$', '', clean_name).strip()
+            
+            # Capitalize words neatly for better API matching
+            clean_name = clean_name.title() if clean_name else landmark_name
+            
+            # 2. Append territorial context
+            search_context = f"{clean_name}, Quebec, Canada"
+            print(f"[Geocoder] Attempting to ground sanitized string: '{search_context}'")
+            
             location = self.geolocator.geocode(search_context, timeout=5)
             if location:
-                print(f"[Geocoder] Grounded '{landmark_name}' to coordinates: {location.latitude}, {location.longitude}")
+                print(f"[Geocoder] Grounded '{landmark_name}' -> '{clean_name}' to: {location.latitude}, {location.longitude}")
                 return location.latitude, location.longitude
+            else:
+                print(f"[Geocoder Warning] Nominatim could not resolve '{search_context}'")
         except Exception as e:
             print(f"[Geocoder Error] Nominatim query failed: {e}")
         return None, None
@@ -179,50 +247,47 @@ class SpatialHybridRAG:
         cursor = collection.find(query).limit(150)
         docs = []
         for doc in cursor:
-            #business names
-            names_obj = doc.get("names", {})
-            business_name = names_obj.get("primary", "Unknown Business")
-            
-            #categories and sector
-            cats_obj = doc.get("categories", {})
-            doc_type = cats_obj.get("primary", "Unknown Type")
-            
-            sector_obj = cats_obj.get("sector", {})
-            sector = sector_obj.get("label", "Unknown Sector")
-            
-            #extract NAICS
-            extracted_naics = str(sector_obj.get("naics", ""))
-            
-            #build rich context
-            rich_text_content = f"Business Name: {business_name}. Type: {doc_type}. Sector: {sector}. NAICS: {extracted_naics}."
-        
-            doc_lon = None
-            doc_lat = None
+            doc_lon, doc_lat = None, None
             if "geometry" in doc and "coordinates" in doc["geometry"]:
                 doc_lon, doc_lat = doc["geometry"]["coordinates"]
+
+            # SCHEMA 1: QUEBEC BUSINESSES
+            if collection_name == "quebec_businesses":
+                names_obj = doc.get("names", {})
+                business_name = names_obj.get("primary", "Unknown Business")
+                cats_obj = doc.get("categories", {})
+                doc_type = cats_obj.get("primary", "Unknown Type")
+                sector_obj = cats_obj.get("sector", {})
+                sector = sector_obj.get("label", "Unknown Sector")
+                extracted_naics = str(sector_obj.get("naics", ""))
+                
+                rich_text_content = f"Business Name: {business_name}. Type: {doc_type}. Sector: {sector}. NAICS: {extracted_naics}."
+                metadata = {
+                    "id": str(doc["_id"]),
+                    "dauid": doc.get("DAUID", "Unknown"),
+                    "source_collection": collection_name,
+                    "lon": doc_lon,  
+                    "lat": doc_lat,
+                    "naics_code": extracted_naics
+                }
+
+            # SCHEMA 2: LOCAUX VACANTS (VACANT SPACES)
+            else:
+                type_local = doc.get("type_local", "Espace vacant")
+                address = doc.get("adresse", "Adresse inconnue")
+                
+                # Build rich context so the semantic search understands the space type
+                rich_text_content = f"Vacant Space Available. Property Type: {type_local}. Address: {address}."
+                metadata = {
+                    "id": str(doc["_id"]),
+                    "source_collection": collection_name,
+                    "lon": doc_lon,  
+                    "lat": doc_lat,
+                    "type_local": type_local
+                }
             
-            metadata = {
-                "id": str(doc["_id"]),
-                "dauid": doc.get("DAUID", "Unknown"),
-                "source_collection": collection_name,
-                "lon": doc_lon,  
-                "lat": doc_lat,
-                "naics_code": extracted_naics
-            }
             docs.append(Document(page_content=rich_text_content, metadata=metadata))
-            # --- TEMPORARY DIAGNOSTIC START ---
-            print(f"\n[DEBUG] Inspecting all {len(docs)} raw candidates fetched from MongoDB:")
-            for i, d in enumerate(docs):
-                name = d.page_content[:30] # Adjust if business name is in metadata
-                db_naics = d.metadata.get("naics_code", "MISSING")
-                dist = d.metadata.get("distance_m", "N/A")
-                # Look specifically for the missing ones or NAICS starting with 81
-                if db_naics.startswith("81") or "81" in db_naics:
-                    print(f"  -> MATCH FOUND IN RAW POOL: {name} | NAICS: {db_naics} | Dist: {dist}m")
-                else:
-                    print(f"  -> {name} | NAICS: {db_naics}")
-            print("[DEBUG] End of raw pool\n")
-            # --- TEMPORARY DIAGNOSTIC END ---
+            
         return docs
 
     def hybrid_semantic_search(self, query: str, spatial_docs: list, top_k: int = 15) -> list:
@@ -263,80 +328,92 @@ class SpatialHybridRAG:
         fused_docs.sort(key=lambda x: x.metadata["semantic_score"], reverse=True)
         return fused_docs[:top_k]
     
-    def pareto_rank(self, hybrid_results: list, ref_lat: float, ref_lon: float, max_radius: float, target_naics: str = None, w_spatial=0.6, w_semantic=0.4) -> list:
+    def pareto_rank(self, hybrid_results: list, ref_lat: float, ref_lon: float, max_radius: float, target_naics: str = None, target_category: str = None, w_spatial=0.6, w_semantic=0.4) -> list:
         ranked_results = []
         for doc in hybrid_results:
             doc_lon = doc.metadata.get("lon")
             doc_lat = doc.metadata.get("lat")
             
+            # 1. Handle missing coordinates gracefully without crashing
             if doc_lon is None or doc_lat is None:
                 doc.metadata["pareto_score"] = 0.0
                 doc.metadata["distance_m"] = max_radius
+                doc.metadata["match_status"] = "Missing Coordinates"
                 ranked_results.append(doc)
                 continue
                 
             try:
-                d_lat = float(doc_lat)
-                d_lon = float(doc_lon)
-                r_lat = float(ref_lat)
-                r_lon = float(ref_lon)
+                d_lat, d_lon, r_lat, r_lon = float(doc_lat), float(doc_lon), float(ref_lat), float(ref_lon)
             except (ValueError, TypeError):
                 doc.metadata["pareto_score"] = 0.0
                 doc.metadata["distance_m"] = max_radius
+                doc.metadata["match_status"] = "Coordinate Error"
                 ranked_results.append(doc)
                 continue
                 
+            # 2. Calculate Distance
             R = 6371000
             phi1, phi2 = math.radians(r_lat), math.radians(d_lat)
             dphi = math.radians(d_lat - r_lat)
             dlam = math.radians(d_lon - r_lon)
             
             a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2) * math.sin(dlam/2)**2
-            a = min(1.0, max(0.0, a))
-            distance_meters = R * 2 * math.asin(math.sqrt(a))
-            
+            distance_meters = R * 2 * math.asin(math.sqrt(min(1.0, max(0.0, a))))
             doc.metadata["distance_m"] = distance_meters
-            spatial_score = 1.0 - (distance_meters / max_radius)
-            spatial_score = max(0.0, min(1.0, spatial_score)) 
             
+            # 3. DEFINE THE MISSING SCORES
+            spatial_score = max(0.0, min(1.0, 1.0 - (distance_meters / max_radius)))
             semantic_score = doc.metadata.get("semantic_score", 0.0)
+            
+            # 4. Calculate Final Hybrid Score
             final_score = (w_spatial * spatial_score) + (w_semantic * semantic_score)
             
-            #taking into account NAICS=> boost score if business category matches business intent of user
-            if target_naics and doc.metadata.get("source_collection") == "quebec_businesses":
+            collection = doc.metadata.get("source_collection")
+            
+            # --- BOOST LOGIC FOR BUSINESSES ---
+            if collection == "quebec_businesses" and target_naics:
                 doc_naics = doc.metadata.get("naics_code", "")
-                
-                #Exact Match or DB is MORE specific (User: "71", DB: "7139")
                 if doc_naics and doc_naics.startswith(target_naics):
                     final_score += 10.0 
-                    doc.metadata["naics_match"] = "Exact/Specific"
-                
-                #User is MORE specific than DB (User: "7139", DB: "71")
+                    doc.metadata["match_status"] = "Exact NAICS"
                 elif doc_naics and target_naics.startswith(doc_naics):
-                    final_score += 5.0  # Partial boost to keep it grouped logically
-                    doc.metadata["naics_match"] = "Broad Group"
-                
+                    final_score += 5.0
+                    doc.metadata["match_status"] = "Broad NAICS"
                 else:
-                    doc.metadata["naics_match"] = "No Match"
+                    doc.metadata["match_status"] = "No Match"
+            
+            # --- BOOST LOGIC FOR VACANT SPACES ---
+            elif collection == "locaux_vacants" and target_category:
+                doc_type = str(doc.metadata.get("type_local", "")).lower()
+                req_type = target_category.lower()
+                service_keywords = ["service", "services", "office", "bureau", "bureaux"]
+                retail_keywords = ["retail", "store", "commerce", "boutique", "commercial"]
+                
+                if (any(k in req_type for k in service_keywords) and "bureau" in doc_type) or \
+                   (any(k in req_type for k in retail_keywords) and "commercial" in doc_type) or \
+                   (req_type in doc_type):
+                    final_score += 10.0
+                    doc.metadata["match_status"] = "Type Local Boosted"
+                else:
+                    doc.metadata["match_status"] = "Semantic Rank Only"
             else:
-                 doc.metadata["naics_match"] = "N/A"
+                 doc.metadata["match_status"] = "Standard Rank"
 
             doc.metadata["pareto_score"] = final_score
             ranked_results.append(doc)
             
         ranked_results.sort(key=lambda x: x.metadata.get("pareto_score", 0.0), reverse=True)
         return ranked_results
-
+    
     def get_smart_demographics(self, location_name: str, lat: float, lon: float, radius: float, requested_fields: list) -> list:
         def aggregate_data(cursor, location_desc):
-            #lower-case mapping for case-sensitive database 
+            # lower-case mapping for case-sensitive database 
             aggregated_totals = {field.lower(): 0.0 for field in requested_fields}
             display_keys = {field.lower(): field for field in requested_fields}
             valid_doc_count = 0
             
             for doc in cursor:
                 valid_doc_count += 1
-    
                 doc_lower = {k.lower(): v for k, v in doc.items()}
                 
                 for target_field in requested_fields:
@@ -369,7 +446,7 @@ class SpatialHybridRAG:
                 metadata={"source": "aggregated_donnees", "blocks_merged": valid_doc_count}
             )]
 
-        #1. MACRO CHECK: city scale 
+        # 1. MACRO CHECK: city scale 
         city_doc = self.db["cities"].find_one({
             "name": {"$regex": f"^{location_name}$", "$options": "i"}
         })
@@ -380,7 +457,7 @@ class SpatialHybridRAG:
             cursor = self.db["donnees"].find({"sdrCode": sdr_code})
             return aggregate_data(cursor, f"the City of {location_name}")
 
-        #2. MICRO CHECK: neighborhood 
+        # 2. MICRO CHECK: neighborhood 
         if radius:
             print(f"[GIS Router] '{location_name}' is a LOCAL area. Searching polygons within {radius} meters.")
             spatial_query = {
@@ -419,6 +496,7 @@ class SpatialHybridRAG:
         target_db = extracted_constraints.get("collection_intent", "both")
         dynamic_fields = extracted_constraints.get("required_fields", [])
         naics_code = extracted_constraints.get("naics_code")
+        raw_category = extracted_constraints.get("business_category", "")
 
         radius = float(raw_radius) if raw_radius is not None else None
         
@@ -432,7 +510,7 @@ class SpatialHybridRAG:
         if dynamic_fields:
             print(f"[Pipeline Execute] LLM Requested Data Fields: {dynamic_fields}")
         
-        #Demographic routers 
+        # Demographic routers 
         if target_db == "demographics":
             print(f"[Pipeline Execute] Rerouting to Spatial GIS lookup for Demographics: {landmark}")
             if not landmark or lat is None or lon is None:
@@ -441,7 +519,7 @@ class SpatialHybridRAG:
                 
             return self.get_smart_demographics(landmark, lat, lon, radius, dynamic_fields)
             
-        #Business/Vacant Properties
+        # Business/Vacant Properties
         search_radius = radius if radius is not None else DEFAULT_RADIUS_METERS
         search_radius = max(100.0, min(float(search_radius), 10000.0))
         all_spatial_candidates = []
@@ -463,13 +541,13 @@ class SpatialHybridRAG:
         hybrid_matches = self.hybrid_semantic_search(
             query=user_query, 
             spatial_docs=all_spatial_candidates, 
-            top_k=len(all_spatial_candidates) #keep all of them before pareto ranking
+            top_k=len(all_spatial_candidates) # keep all of them before pareto ranking
         )
-        final_docs = self.pareto_rank(hybrid_matches, lat, lon, search_radius, target_naics=naics_code)
+        final_docs = self.pareto_rank(hybrid_matches, lat, lon, search_radius, target_naics=naics_code, target_category=raw_category)
         return final_docs
 
 
-#EXECUTION PIPELINE 
+# EXECUTION PIPELINE 
 if __name__ == "__main__":
     load_dotenv()
     cloud_uri = os.getenv("MONGO_URI")
@@ -488,14 +566,15 @@ if __name__ == "__main__":
     print("TEST 4: BUSINESS ROUTING WITH NAICS CODE BOOST")
     print("="*60)
     
-    # 7225 is the standard NAICS prefix for "Restaurants and Other Eating Places"
-    naics_query = "Find me all businesses that are Commerce de détail within 100m of the Place Boyer in Montreal."
+    # 62 represents the NAICS prefix for "Soins de santé et assistance sociale" 
+    # (Healthcare and Social Assistance)
+    naics_query = "Find me all vacant spaces that are associated to offices within 300m Saint-Hyacinthe city center."
+
     
-    # Coordinates for downtown Montreal (Bell Centre area)
     naics_results = geo_rag.query_pipeline(
         user_query=naics_query, 
-        fallback_lat=45.4961, 
-        fallback_lon=-73.5693
+        fallback_lat=45.625902, 
+        fallback_lon=-72.946463
     )
     
     if not naics_results:
@@ -503,15 +582,13 @@ if __name__ == "__main__":
     else:
         print(f"\n  Top 5 Results for '{naics_query}':\n")
         for i, match in enumerate(naics_results[:5]):
-            # Extract metadata to prove the boost worked
             doc_id = match.metadata.get('id', 'Unknown')
             doc_naics = match.metadata.get('naics_code', 'None')
             is_match = match.metadata.get('naics_match', False)
             distance = round(match.metadata.get('distance_m', 0))
             score = round(match.metadata.get('pareto_score', 0.0), 3)
             
-            # Format the output so we can easily read the ranking signals
-            match_status = "[★ NAICS BOOSTED]" if is_match else "[Standard Rank]"
+            match_status = "[★ NAICS BOOSTED]" if is_match and is_match != "No Match" and is_match != "N/A" else "[Standard Rank]"
             
             print(f"  {i+1}. {match_status} Score: {score} | Distance: {distance}m | NAICS: {doc_naics}")
             print(f"     Content: {match.page_content[:150]}...\n")

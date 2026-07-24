@@ -137,13 +137,21 @@ TOOL_DEFINITIONS = [
                 },
                 "business_type": {
                     "type": "string",
-                    "description": "Free-text category to boost matches on, e.g. 'yoga studio', "
-                                   "'vacant office'. Omit if not filtering by type.",
+                    "description": "Free-text category to boost matches on (semantic ranking, "
+                                   "not a hard filter), e.g. 'yoga studio', 'vacant office'. Omit "
+                                   "if not filtering by type. Prefer naics_code instead whenever "
+                                   "you know it - it's an exact filter, this is a soft ranking hint.",
                 },
                 "naics_code": {
                     "type": "string",
-                    "description": "Explicit NAICS code to boost exact/broad matches on, e.g. "
-                                   "'722'. Omit if the user didn't name one.",
+                    "description": "Explicit NAICS code to filter businesses to, e.g. '722' "
+                                   "(restaurants) or '6212' (dentists) - matches any business "
+                                   "whose own NAICS code falls under this one, at any level of "
+                                   "the hierarchy. Use this (not business_type) for 'show me the "
+                                   "businesses in category X' - it's an actual database filter, "
+                                   "not a ranking boost, so it returns every matching business in "
+                                   "range rather than just the closest/best-scoring few. Omit if "
+                                   "the user didn't name or imply a specific category.",
                 },
             },
             "required": ["location"],
@@ -214,11 +222,15 @@ TOOL_DEFINITIONS = [
                 },
                 "business_type": {
                     "type": "string",
-                    "description": "Free-text category to boost/filter on for every location, e.g. 'bakery'.",
+                    "description": "Free-text category to boost on for every location (semantic "
+                                   "ranking, not a hard filter), e.g. 'bakery'.",
                 },
                 "naics_code": {
                     "type": "string",
-                    "description": "Explicit NAICS code to boost/filter on for every location.",
+                    "description": "Explicit NAICS code to filter every location's results to - "
+                                   "see spatial_search's naics_code for the containment/matching "
+                                   "rule. Prefer this over business_type when the category is a "
+                                   "known NAICS code.",
                 },
             },
             "required": ["location_names"],
@@ -614,20 +626,33 @@ def spatial_search(
 ) -> dict:
     """Wraps hard_spatial_filter + hybrid_semantic_search + pareto_rank - the
     same combo query_pipeline runs - searching both collections by default
-    (query_pipeline's "both" behavior when nothing narrows the target)."""
+    (query_pipeline's "both" behavior when nothing narrows the target).
+
+    When naics_code is given, this is a "show me businesses in category X"
+    request, not an open-ended relevance search - hard_spatial_filter pushes
+    the NAICS match into the Mongo query itself (see its docstring) and the
+    expensive hybrid_semantic_search re-embedding pass is skipped entirely,
+    since every surviving candidate already matches the requested category;
+    ranking is by distance + the same NAICS-containment boost pareto_rank
+    always applies. locaux_vacants has no NAICS field at all, so it's
+    skipped rather than fetched and then discarded."""
     lat, lon = geo_rag.geocode_landmark(location)
     if lat is None or lon is None:
         return {"error": f"Could not geocode '{location}'", "results": []}
 
+    collections_to_search = ["quebec_businesses"] if naics_code else SPATIAL_SEARCH_COLLECTIONS
     candidates = []
-    for collection in SPATIAL_SEARCH_COLLECTIONS:
-        candidates.extend(geo_rag.hard_spatial_filter(collection, lon, lat, radius_meters))
+    for collection in collections_to_search:
+        candidates.extend(geo_rag.hard_spatial_filter(collection, lon, lat, radius_meters, naics_prefix=naics_code))
 
     if not candidates:
         return {"results": []}
 
-    query_text = business_type or naics_code or location
-    ranked = geo_rag.hybrid_semantic_search(query=query_text, spatial_docs=candidates, top_k=len(candidates))
+    if naics_code:
+        ranked = candidates
+    else:
+        query_text = business_type or location
+        ranked = geo_rag.hybrid_semantic_search(query=query_text, spatial_docs=candidates, top_k=len(candidates))
     ranked = geo_rag.pareto_rank(ranked, radius_meters, target_naics=naics_code, target_category=business_type)
 
     return {

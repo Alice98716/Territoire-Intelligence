@@ -272,7 +272,21 @@ class SpatialHybridRAG:
             doc_type = cats_obj.get("primary", "Unknown Type")
             sector_obj = cats_obj.get("sector") or {}
             sector = sector_obj.get("label", "Unknown Sector")
-            extracted_naics = str(sector_obj.get("naics", ""))
+            # categories has 3 NAICS levels (sector "62" -> subsector "621" ->
+            # group "6211"), every one of which is populated on every business
+            # document (confirmed against the live collection). Using only
+            # sector.naics here meant EVERY business under a given 2-digit
+            # sector (e.g. all of "62" - doctors, dentists, pharmacies,
+            # massage therapists...) carried the identical NAICS code, so
+            # pareto_rank's category matching could never tell them apart.
+            # Use the most granular code available so "show me dentists"
+            # (NAICS 6212) actually distinguishes from "show me pharmacies"
+            # (6219) instead of both just matching "62".
+            subsector_obj = cats_obj.get("subsector") or {}
+            group_obj = cats_obj.get("group") or {}
+            extracted_naics = str(
+                group_obj.get("naics") or subsector_obj.get("naics") or sector_obj.get("naics") or ""
+            )
             # addresses is a list (Overture Maps schema), not a flat string like
             # locaux_vacants' "adresse" - freeform is the closest street-address
             # equivalent. "or []" guards the same explicit-null case as above.
@@ -320,7 +334,8 @@ class SpatialHybridRAG:
         return Document(page_content=rich_text_content, metadata=metadata)
 
     # MODIFICATION 3: Offload spatial filtering and distance calculation to MongoDB Aggregation
-    def hard_spatial_filter(self, collection_name: str, lon: float, lat: float, max_distance_meters: float) -> list:
+    def hard_spatial_filter(self, collection_name: str, lon: float, lat: float, max_distance_meters: float,
+                             naics_prefix: Optional[str] = None) -> list:
         collection = self.db[collection_name]
 
         pipeline = [
@@ -332,8 +347,28 @@ class SpatialHybridRAG:
                     "spherical": True
                 }
             },
-            {"$limit": 150}
         ]
+
+        # Push the NAICS filter into the query itself instead of fetching the
+        # 150 nearest businesses of ANY type and hoping enough of the
+        # requested category happen to be among them - that would silently
+        # drop real matches sitting just past the 150th-nearest unrelated
+        # business. $or across all 3 levels since a request for a broad code
+        # ("62") should match a business classified more specifically
+        # ("6211"), same containment rule pareto_rank applies below.
+        if naics_prefix and collection_name == "quebec_businesses":
+            escaped = re.escape(naics_prefix)
+            pipeline.append({
+                "$match": {
+                    "$or": [
+                        {"categories.group.naics": {"$regex": f"^{escaped}"}},
+                        {"categories.subsector.naics": {"$regex": f"^{escaped}"}},
+                        {"categories.sector.naics": {"$regex": f"^{escaped}"}},
+                    ]
+                }
+            })
+
+        pipeline.append({"$limit": 150})
 
         cursor = collection.aggregate(pipeline)
         return [self._doc_from_mongo(doc, collection_name, distance_m=doc.get("distance_m", 0.0)) for doc in cursor]

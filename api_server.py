@@ -1654,11 +1654,19 @@ def chat_turn_1(request: Request, payload: ChatTurn1Request):
             # Hard spatial pre-filter ($geoNear per collection) — same radius
             # the old raw query used, now via geo_rag so the candidates carry
             # the metadata (lon/lat/type/NAICS/etc.) hybrid_semantic_search needs.
+            # naics_query is pushed into the query itself (hard_spatial_filter
+            # only applies it to quebec_businesses - a no-op for locaux_vacants,
+            # which has no NAICS field) so a category ask filters BEFORE the
+            # 150-candidate cap instead of after, the same fix applied to
+            # tools.spatial_search (see its docstring for why: otherwise a real
+            # match sitting past the 150th-nearest unrelated result silently
+            # never made it into the candidate set at all).
             candidates = []
             for collection in target_collections:
                 candidates.extend(
                     geo_rag.hard_spatial_filter(
-                        collection, target_lng, target_lat, DEFAULT_SPATIAL_SEARCH_RADIUS_M
+                        collection, target_lng, target_lat, DEFAULT_SPATIAL_SEARCH_RADIUS_M,
+                        naics_prefix=naics_query,
                     )
                 )
             print(f"[Spatial Search] {len(candidates)} candidate(s) within "
@@ -1682,17 +1690,28 @@ def chat_turn_1(request: Request, payload: ChatTurn1Request):
             # matches if the user named a code. Falls back to distance-only
             # ordering if the embedding model isn't reachable, rather than
             # dropping the spatial_search intent entirely.
+            #
+            # When naics_query is set, every candidate already matches it (the
+            # filter above is a hard DB-level match, not a soft boost), so
+            # there's nothing left for semantic search to usefully rank on -
+            # skip the re-embedding pass entirely (the dominant cost of this
+            # whole request, see hybrid_semantic_search) and rank by distance
+            # + the NAICS boost pareto_rank still applies for consistent
+            # match_status labeling.
             try:
-                # top_k=len(candidates): hybrid_semantic_search's own default
-                # (top 15) would silently drop candidates before pareto_rank's
-                # NAICS/category/budget boosts ever got a chance to run on them
-                # - a real match ranking outside the top 15 on raw semantic
-                # similarity to the full (noisy) message would simply vanish.
-                ranked = geo_rag.hybrid_semantic_search(
-                    query=intent_data.get("raw_message", target_landmark),
-                    spatial_docs=candidates,
-                    top_k=len(candidates),
-                )
+                if naics_query:
+                    ranked = candidates
+                else:
+                    # top_k=len(candidates): hybrid_semantic_search's own default
+                    # (top 15) would silently drop candidates before pareto_rank's
+                    # NAICS/category/budget boosts ever got a chance to run on them
+                    # - a real match ranking outside the top 15 on raw semantic
+                    # similarity to the full (noisy) message would simply vanish.
+                    ranked = geo_rag.hybrid_semantic_search(
+                        query=intent_data.get("raw_message", target_landmark),
+                        spatial_docs=candidates,
+                        top_k=len(candidates),
+                    )
                 ranked = geo_rag.pareto_rank(
                     ranked, DEFAULT_SPATIAL_SEARCH_RADIUS_M,
                     target_naics=naics_query,
@@ -1936,17 +1955,29 @@ def chat_turn_1(request: Request, payload: ChatTurn1Request):
                 candidates = []
                 for collection in target_collections:
                     candidates.extend(
-                        geo_rag.hard_spatial_filter(collection, lng, lat, DEFAULT_SPATIAL_SEARCH_RADIUS_M)
+                        geo_rag.hard_spatial_filter(
+                            collection, lng, lat, DEFAULT_SPATIAL_SEARCH_RADIUS_M,
+                            naics_prefix=naics_query,
+                        )
                     )
                 entry["candidate_count"] = len(candidates)
 
                 if candidates:
                     try:
-                        ranked = geo_rag.hybrid_semantic_search(
-                            query=intent_data.get("raw_message", loc_name),
-                            spatial_docs=candidates,
-                            top_k=len(candidates),
-                        )
+                        # naics_query already hard-filtered candidates above (see
+                        # hard_spatial_filter) - re-embedding them against the raw
+                        # message would only add latency, not signal, and
+                        # matched_count below depends on every real match having
+                        # survived the filter rather than being crowded out of a
+                        # semantic top_k cut.
+                        if naics_query:
+                            ranked = candidates
+                        else:
+                            ranked = geo_rag.hybrid_semantic_search(
+                                query=intent_data.get("raw_message", loc_name),
+                                spatial_docs=candidates,
+                                top_k=len(candidates),
+                            )
                         ranked = geo_rag.pareto_rank(
                             ranked, DEFAULT_SPATIAL_SEARCH_RADIUS_M,
                             target_naics=naics_query,

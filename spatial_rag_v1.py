@@ -5,6 +5,8 @@ import json
 import pymongo
 import os
 import math
+import time
+import threading
 import unicodedata
 from collections import OrderedDict
 from typing import List, Optional
@@ -251,6 +253,15 @@ class SpatialHybridRAG:
         # Ollama every time - see hybrid_semantic_search for why that re-embed
         # cost otherwise dominates its latency.
         self._embedding_cache: dict = {}
+        # landmark name (lowercased/stripped) -> (lat, lon), populated lazily
+        # by geocode_landmark. Landmarks don't move, and the same string is
+        # routinely geocoded more than once per request (e.g. the agent loop
+        # calling the geocode tool, then spatial_search independently
+        # re-geocoding the same location internally) - see geocode_landmark
+        # for the Nominatim rate-limit reasoning this pairs with.
+        self._geocode_cache: dict = {}
+        self._geocode_lock = threading.Lock()
+        self._last_geocode_call_time = 0.0
 
     # ------------------------------------------------------------------
     # Shared document construction (was duplicated in hard_spatial_filter)
@@ -391,7 +402,25 @@ class SpatialHybridRAG:
         cursor = collection.find(geo_query).limit(150)
         return [self._doc_from_mongo(doc, collection_name) for doc in cursor]
 
+    # Nominatim's usage policy requires >=1s between requests, and threatens
+    # IP-level blocking for violators - a real availability risk, not just a
+    # latency one, since every geocode-dependent tool (spatial_search,
+    # compare_locations, get_demographics, ...) would break at once for every
+    # user if this server's IP got banned. The old CLI prototype (main.py)
+    # enforced this with a per-call time.sleep(); that got lost in the
+    # rewrite. Re-added here as a process-wide gate (a lock, not a per-call
+    # sleep) since the app now runs sync endpoints in a thread pool - without
+    # the lock, concurrent requests geocoding different landmarks at the same
+    # time could still fire simultaneous Nominatim calls.
+    _NOMINATIM_MIN_INTERVAL_S = 1.0
+
     def geocode_landmark(self, landmark_name: str) -> tuple:
+        cache_key = landmark_name.strip().lower()
+        cached = self._geocode_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        result = (None, None)
         try:
             clean_name = landmark_name.lower()
             suffixes_to_remove = ["city center", "city centre", "center", "centre", "downtown", "centre-ville"]
@@ -401,12 +430,25 @@ class SpatialHybridRAG:
             clean_name = clean_name.title() if clean_name else landmark_name
             search_context = f"{clean_name}, Quebec, Canada"
 
-            location = self.geolocator.geocode(search_context, timeout=5)
+            with self._geocode_lock:
+                wait = self._NOMINATIM_MIN_INTERVAL_S - (time.time() - self._last_geocode_call_time)
+                if wait > 0:
+                    time.sleep(wait)
+                location = self.geolocator.geocode(search_context, timeout=5)
+                self._last_geocode_call_time = time.time()
+
             if location:
-                return location.latitude, location.longitude
+                result = (location.latitude, location.longitude)
         except Exception as e:
             print(f"[Geocoder Error] Nominatim query failed: {e}")
-        return None, None
+
+        # Only cache real hits - a miss/exception here could be a transient
+        # network blip rather than "this landmark doesn't exist", and
+        # permanently caching that for the life of the process would make a
+        # temporary Nominatim outage look like a permanent geocoding failure.
+        if result != (None, None):
+            self._geocode_cache[cache_key] = result
+        return result
 
     def hybrid_semantic_search(self, query: str, spatial_docs: list, top_k: int = 15) -> list:
         if not spatial_docs:

@@ -3,8 +3,16 @@
 baseline_rag_v3.py — Territoire Intelligence RAG
 ==================================================
 3 paths
-Added quebec_business data 
+Added quebec_business data
 ─────────────────────────────────────────────────────────
+
+NOTE: this is the earlier CLI-REPL prototype, kept around only because
+test_pipeline_layer0and1.py (and the other test_pipeline_layer*.py files)
+still import helpers from it (haversine_m, geocode_address,
+classify_question, etc.). It talks to DB_NAME="overture_maps", a DIFFERENT
+database than the production stack. The current production entry point is
+api_server.py (FastAPI + spatial_rag_v1.SpatialHybridRAG, DB_NAME="ti_city"),
+not this file - don't treat this as the live server.
 """
 
 import os

@@ -881,6 +881,46 @@ Respond with ONLY valid JSON, nothing else:
         return {"match": None, "confidence": 0.0, "method": "ollama_fallback"}
 
 
+@app.post("/api/classify-naics")
+@limiter.limit("30/minute")
+def classify_naics(request: Request, payload: dict):
+    """
+    Unconstrained NAICS classification for a free-text business description —
+    returns the classifier's real top result at whatever granularity the
+    nearest embedding actually is (sector, subsector, OR group/4-digit),
+    not just whichever label happens to be in a candidate list.
+
+    match_sector_category above can never return a group-level code: its
+    `candidates` are always the frontend's sector+subsector labels only, and
+    it rejects anything not literally in that list. This endpoint exists so
+    the chat pipeline can resolve "resto de sushi" straight to a specific
+    NAICS group when the classifier is confident enough, instead of
+    stopping at the parent subsector.
+
+    Confidence is NOT well-calibrated (see NAICSClassifier.classify_business_type's
+    own docstring — a good match scores ~0.6, a plausible-but-wrong one
+    ~0.44, an outright bad one can still land ~0.30-0.35). This endpoint
+    deliberately does not decide accept/reject itself — it returns the raw
+    top-k ranked list and leaves the threshold call to the caller, so the
+    frontend can apply a stricter bar for auto-applying a Group-level filter
+    than it would for a broader sector-level one.
+
+    Request body: {"message": "resto de sushi"}
+    Response: {"results": [{"code": "722511", "label": "...", "confidence": 0.61}, ...]}
+    """
+    message = payload.get("message", "").strip()
+    if not message:
+        return {"results": []}
+    if naics_classifier is None:
+        print("[NAICS] classify-naics called but naics_classifier is not ready yet", flush=True)
+        return {"results": []}
+
+    results = naics_classifier.classify_business_type(message, top_k=3)
+    print(f"[NAICS] classify-naics(\"{message}\") -> "
+          f"{[(r['code'], r['label'], round(r['confidence'], 2)) for r in results]}", flush=True)
+    return {"results": results}
+
+
 def fast_extract_intent(message: str) -> Optional[dict]:
     """
     Fast regex-based intent extraction with confidence-aware fallback to LLM.

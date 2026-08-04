@@ -11,6 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import asyncio
 import json
 import re
 import time
@@ -78,14 +79,16 @@ if not cloud_uri:
 
 from spatial_rag_v1 import SpatialHybridRAG, NAICSClassifier, DB_NAME
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS
+from agents import Orchestrator
 
 #Declare the variable globally
 geo_rag: Optional[SpatialHybridRAG] = None
 naics_classifier: Optional[NAICSClassifier] = None
+orchestrator: Optional[Orchestrator] = None
 
 @app.on_event("startup")
 async def startup_event():
-    global geo_rag, naics_classifier
+    global geo_rag, naics_classifier, orchestrator
     print(f"[3/4] Connecting to MongoDB and initializing Spatial Engine (DB: {DB_NAME})...", flush=True)
     try:
         geo_rag = SpatialHybridRAG(mongo_uri=cloud_uri, db_name=DB_NAME)
@@ -107,6 +110,13 @@ async def startup_event():
     except Exception as e:
         print(f"[NAICS] Classifier init failed — match_sector_category will fall back to "
               f"Ollama-only: {e}", flush=True)
+
+    # Multi-agent system (agents/) - geo_rag is required and already
+    # confirmed ready above; naics_classifier is forwarded even if it
+    # failed to build (None), same best-effort handling CompetitiveAgent
+    # itself already does for a missing classifier.
+    orchestrator = Orchestrator(geo_rag, naics_classifier)
+    print("[Agents] Orchestrator ready (competitive + regulatory -> synthesis).", flush=True)
 
 # ─── GEOCODING ENDPOINT ──────────────────────────────────────────────────
 # Strategy: try Nominatim (OpenStreetMap) first — free, no API key, no billing.
@@ -919,6 +929,53 @@ def classify_naics(request: Request, payload: dict):
     print(f"[NAICS] classify-naics(\"{message}\") -> "
           f"{[(r['code'], r['label'], round(r['confidence'], 2)) for r in results]}", flush=True)
     return {"results": results}
+
+
+# ─── MULTI-AGENT ANALYSIS ENDPOINT ──────────────────────────────────────
+class AgentAnalysisRequest(BaseModel):
+    location: str
+    business_type: Optional[str] = None
+    naics_code: Optional[str] = None
+    radius_meters: Optional[float] = None
+    identifier: Optional[str] = None
+    identifier_type: Optional[str] = None
+
+
+@app.post("/api/agents/analyze")
+@limiter.limit("10/minute")
+def analyze_with_agents(request: Request, payload: AgentAnalysisRequest):
+    """
+    Runs the multi-agent pipeline (agents/) for a location: CompetitiveAgent
+    (competitor saturation) and RegulatoryAgent (zoning/permitted-use) run
+    concurrently, then SynthesisAgent combines their reports into one
+    verdict. Foundation-stage - only these two specialized agents exist so
+    far (see agents/README.md); Demographer, Real Estate, and Economist
+    aren't wired in yet, so `data.agent_reports` currently only ever has
+    "competitive"/"regulatory" keys.
+
+    Synchronous endpoint (like the rest of this file) so FastAPI runs it in
+    its worker threadpool rather than on the event loop - CompetitiveAgent/
+    RegulatoryAgent do blocking pymongo calls under the hood, same as every
+    other geo_rag-backed endpoint here. asyncio.run() below is safe because
+    of that: each call gets its own fresh event loop in its own worker
+    thread, never a loop already running on the calling thread.
+
+    Request body: {
+        "location": "123 Rue Principale, Bromont",
+        "business_type": "restaurant",          // optional
+        "naics_code": "7225",                    // optional
+        "radius_meters": 1500,                   // optional
+        "identifier": "681921118600010000",      // optional
+        "identifier_type": "matricule"           // optional, required if identifier given
+    }
+    Response: SynthesisAgent's envelope (agent/status/data/error/processing_time_ms/timestamp).
+    """
+    if orchestrator is None:
+        print("[Agents] /api/agents/analyze called but orchestrator is not ready yet", flush=True)
+        return {"error": "Multi-agent system is not ready yet - try again shortly."}
+
+    intent = payload.model_dump(exclude_none=True)
+    return asyncio.run(orchestrator.run(intent))
 
 
 def fast_extract_intent(message: str) -> Optional[dict]:

@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: territoire-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Local MongoDB for development only. Production/staging use MongoDB
+  # Atlas via the MONGO_URI env var (see .env.example) - this service is
+  # not used unless MONGO_URI is pointed at it explicitly.
+  mongodb:
+    image: mongo:7
+    container_name: territoire-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-dev}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-dev}
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-territoire_intelligence}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:
+  mongo_data:
